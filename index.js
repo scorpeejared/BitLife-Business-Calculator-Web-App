@@ -216,7 +216,8 @@ class AnnualCycleLearner {
             const businessSize = this.getBusinessSize(actualSales);
             
             // Update year record
-            const yearKey = `${this.currentYear}-${method}`;
+            // Unique per completed year; the real calendar year would collide on repeat resets
+            const yearKey = `${method}-${Date.now()}`;
             this.history.years[yearKey] = {
                 method: method,
                 predicted: lastPred.demand,
@@ -691,8 +692,8 @@ class CalculatorUtils {
             const numValue = parseFloat(cleanValue);
             if (!isNaN(numValue)) {
                 if (isPercentageField) {
-                    // Percentage fields: no commas, just the number
-                    input.value = numValue.toString();
+                    // Percentage fields: keep what was typed so "2." and "2.0" survive until blur
+                    input.value = cleanValue;
                 } else {
                     // Regular number fields: add commas
                     input.value = numValue.toLocaleString('en-US');
@@ -761,9 +762,6 @@ class CalculatorUtils {
         const scenario = BUSINESS_SCENARIOS[businessScenario] || BUSINESS_SCENARIOS.normal;
         let minProduction = requiredProduction * scenario.minMultiplier;
         
-        // Add some randomness (±5%) to simulate real-world variability
-        const randomFactor = 0.95 + (Math.random() * 0.1); // 0.95 to 1.05
-        minProduction = minProduction * randomFactor;
         
         // Round to nearest 100 for realistic numbers
         minProduction = Math.round(minProduction / 100) * 100;
@@ -987,6 +985,87 @@ class AnimationManager {
     }
 }
 
+// ===== PROFIT CALCULATOR =====
+class ProfitCalculator {
+    static INPUT_IDS = ['profit-custom-units', 'profit-units-sold', 'profit-price', 'profit-fixed', 'profit-supplier', 'profit-marketing-pct'];
+
+    static init() {
+        const source = document.getElementById('profit-source');
+        source.addEventListener('change', () => {
+            document.getElementById('profit-custom-group').classList.toggle('hidden', source.value !== 'custom');
+            ProfitCalculator.calculate();
+        });
+
+        ProfitCalculator.INPUT_IDS.forEach(id => {
+            const input = document.getElementById(id);
+            input.addEventListener('input', () => {
+                // Digits and a single decimal point only
+                const parts = input.value.replace(/[^0-9.]/g, '').split('.');
+                input.value = parts.length > 1 ? `${parts[0]}.${parts.slice(1).join('')}` : parts[0];
+                ProfitCalculator.calculate();
+            });
+        });
+
+        ProfitCalculator.calculate();
+    }
+
+    static readNumber(id) {
+        return CalculatorUtils.parseInputValue(document.getElementById(id).value);
+    }
+
+    static getProduction() {
+        const source = document.getElementById('profit-source').value;
+        if (source === 'custom') return ProfitCalculator.readNumber('profit-custom-units');
+
+        const text = document.getElementById(source === 'method1' ? 'production-value' : 'production-analyst-value').textContent;
+        return CalculatorUtils.parseInputValue(text);
+    }
+
+    static formatMoney(amount, decimals) {
+        const sign = amount < 0 ? '-' : '';
+        return `${sign}$${Math.abs(amount).toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
+    }
+
+    static calculate() {
+        const production = ProfitCalculator.getProduction();
+        const soldRaw = document.getElementById('profit-units-sold').value.trim();
+        const unitsSold = soldRaw === '' ? production : CalculatorUtils.parseInputValue(soldRaw);
+        const price = ProfitCalculator.readNumber('profit-price');
+        const fixedCost = ProfitCalculator.readNumber('profit-fixed');
+        const supplierCost = ProfitCalculator.readNumber('profit-supplier');
+        const marketingPct = ProfitCalculator.readNumber('profit-marketing-pct');
+
+        // Gross Revenue = Units Sold × Price per Unit
+        const revenue = unitsSold * price;
+        // Marketing Cost = Gross Revenue × Marketing %
+        const marketingCost = revenue * (marketingPct / 100);
+        // Marketing Cost per Unit = Marketing Cost ÷ Production
+        const marketingPerUnit = production > 0 ? marketingCost / production : 0;
+        // Break-Even Price = Fixed Cost + Supplier Cost + Marketing Cost per Unit
+        const breakEven = fixedCost + supplierCost + marketingPerUnit;
+        const profitPerUnit = price - breakEven;
+        // Unsold units still carry their fixed and supplier costs
+        const totalProfit = revenue - production * (fixedCost + supplierCost) - marketingCost;
+
+        const money = ProfitCalculator.formatMoney;
+        document.getElementById('profit-production').textContent = CalculatorUtils.formatNumber(production);
+        document.getElementById('profit-revenue').textContent = money(revenue, 0);
+        document.getElementById('profit-marketing').textContent = money(marketingCost, 0);
+        document.getElementById('profit-marketing-unit').textContent = money(marketingPerUnit, 2);
+        document.getElementById('profit-breakeven').textContent = money(breakEven, 2);
+        document.getElementById('profit-per-unit').textContent = money(profitPerUnit, 2);
+        document.getElementById('profit-total').textContent = money(totalProfit, 0);
+
+        let status = '';
+        if (production > 0 && price > 0 && profitPerUnit < 0) {
+            status = '⚠️ Price is below break-even. Raise the price or cut costs.';
+        } else if (production > 0 && unitsSold < production) {
+            status = `ℹ️ ${CalculatorUtils.formatNumber(production - unitsSold)} unsold units still carry their production costs.`;
+        }
+        document.getElementById('profit-status').textContent = status;
+    }
+}
+
 // ===== MAIN CALCULATOR =====
 class BitLifeCalculator {
     /**
@@ -1031,9 +1110,14 @@ class BitLifeCalculator {
             
             // Calculate minimum production buffer
             const minProductionBuffer = minBufferPct > 0 ? forecastDemand * (minBufferPct / 100) : 0;
-            
+
             // Never recommend negative production, but enforce minimum buffer if set
             requiredProduction = Math.max(requiredProduction, minProductionBuffer);
+
+            // A negative buffer cuts production by that % of demand
+            if (minBufferPct < 0) {
+                requiredProduction = Math.max(0, requiredProduction + forecastDemand * (minBufferPct / 100));
+            }
             
             // Calculate smart minimum production based on business scenario
             const businessScenario = CalculatorUtils.getBusinessScenario(sales, productionLastYear, forecastPct);
@@ -1090,6 +1174,7 @@ class BitLifeCalculator {
             productionValue.textContent = CalculatorUtils.formatNumber(requiredProduction);
             minProductionValue.textContent = CalculatorUtils.formatNumber(smartMinProduction);
             statusMessage.textContent = statusMsg;
+            ProfitCalculator.calculate();
             
         } catch (error) {
             console.error('Method 1 Calculation Error:', error);
@@ -1141,9 +1226,14 @@ class BitLifeCalculator {
             
             // Calculate minimum production buffer
             const minProductionBuffer = minBufferPct > 0 ? totalForecastDemand * (minBufferPct / 100) : 0;
-            
+
             // Never recommend negative production, but enforce minimum buffer if set
             requiredProduction = Math.max(requiredProduction, minProductionBuffer);
+
+            // A negative buffer cuts production by that % of demand
+            if (minBufferPct < 0) {
+                requiredProduction = Math.max(0, requiredProduction + totalForecastDemand * (minBufferPct / 100));
+            }
             
             // Calculate smart minimum production based on business scenario
             const estimatedForecastPct = additionalForecast > 0 ? 
@@ -1196,6 +1286,7 @@ class BitLifeCalculator {
             productionAnalystValue.textContent = CalculatorUtils.formatNumber(requiredProduction);
             minProductionAnalystValue.textContent = CalculatorUtils.formatNumber(smartMinProduction);
             statusAnalystMessage.textContent = statusMsg;
+            ProfitCalculator.calculate();
             
         } catch (error) {
             console.error('Method 2 Calculation Error:', error);
@@ -1373,7 +1464,10 @@ function initializeApp() {
     
     // Set up input event listeners with comma formatting
     setupEventListeners();
-    
+
+    // Initialize profit calculator
+    ProfitCalculator.init();
+
     // Add CSS for minimum production styling
     addMinimumProductionCSS();
     
@@ -1618,7 +1712,13 @@ function showLearningStats() {
     });
     
     // Close functions
+    const handleEscape = (e) => {
+        if (e.key === 'Escape') {
+            closeModal();
+        }
+    };
     const closeModal = () => {
+        document.removeEventListener('keydown', handleEscape);
         modal.style.opacity = '0';
         modal.style.transform = 'scale(0.95)';
         setTimeout(() => {
@@ -1733,20 +1833,8 @@ function showLearningStats() {
         }
         
         // Add Escape key support
-        const handleEscape = (e) => {
-            if (e.key === 'Escape') {
-                closeModal();
-                document.removeEventListener('keydown', handleEscape);
-            }
-        };
         document.addEventListener('keydown', handleEscape);
         
-        // Cleanup on close
-        const originalCloseModal = closeModal;
-        closeModal = () => {
-            document.removeEventListener('keydown', handleEscape);
-            originalCloseModal();
-        };
         
     }, 100);
     
